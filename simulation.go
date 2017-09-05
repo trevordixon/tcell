@@ -107,6 +107,10 @@ type simscreen struct {
 	sync.Mutex
 }
 
+func (s *simscreen) WaitForInput() ([]Event, error) {
+	return nil, nil
+}
+
 func (s *simscreen) Init() error {
 	s.evch = make(chan Event, 10)
 	s.fillchar = 'X'

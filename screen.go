@@ -82,6 +82,7 @@ type Screen interface {
 	// must spin on this to prevent the application from stalling.
 	// Furthermore, this will return nil if the Screen is finalized.
 	PollEvent() Event
+	WaitForInput() ([]Event, error)
 
 	// PostEvent tries to post an event into the event stream.  This
 	// can fail if the event queue is full.  In that case, the event

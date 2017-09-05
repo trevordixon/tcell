@@ -17,13 +17,36 @@ package tcell
 import (
 	"bytes"
 	"io"
+	"log"
 	"os"
-	"strconv"
 	"sync"
 	"unicode/utf8"
 
 	"golang.org/x/text/transform"
 )
+
+func NewTerminfoScreenFromIO(term string, in io.Reader, out io.Writer) (Screen, error) {
+	ti, e := LookupTerminfo(term)
+	if e != nil {
+		return nil, e
+	}
+	t := &tScreen{ti: ti, in: in, out: out}
+
+	t.keyexist = make(map[Key]bool)
+	t.keycodes = make(map[string]*tKeyCode)
+	if len(ti.Mouse) > 0 {
+		t.mouse = []byte(ti.Mouse)
+	}
+	t.prepareKeys()
+	t.buildAcsMap()
+	t.sigwinch = make(chan os.Signal, 10)
+	t.fallback = make(map[rune]string)
+	for k, v := range RuneFallbacks {
+		t.fallback[k] = v
+	}
+
+	return t, nil
+}
 
 // NewTerminfoScreen returns a Screen that uses the stock TTY interface
 // and POSIX termios, combined with a terminfo description taken from
@@ -69,11 +92,13 @@ type tScreen struct {
 	w         int
 	fini      bool
 	cells     CellBuffer
-	in        *os.File
-	out       *os.File
+	in        io.Reader
+	out       io.Writer
 	curstyle  Style
 	style     Style
 	evch      chan Event
+	inbuf     *bytes.Buffer
+	inchunk   []byte
 	sigwinch  chan os.Signal
 	quit      chan struct{}
 	indoneq   chan struct{}
@@ -103,7 +128,8 @@ type tScreen struct {
 }
 
 func (t *tScreen) Init() error {
-	t.evch = make(chan Event, 10)
+	// t.evch = make(chan Event, 10)
+	t.evch = make(chan Event)
 	t.indoneq = make(chan struct{})
 	t.charset = "UTF-8"
 
@@ -119,24 +145,24 @@ func (t *tScreen) Init() error {
 	// environment overrides
 	w := ti.Columns
 	h := ti.Lines
-	if i, _ := strconv.Atoi(os.Getenv("LINES")); i != 0 {
-		h = i
-	}
-	if i, _ := strconv.Atoi(os.Getenv("COLUMNS")); i != 0 {
-		w = i
-	}
-	if e := t.termioInit(); e != nil {
-		return e
-	}
+	// if i, _ := strconv.Atoi(os.Getenv("LINES")); i != 0 {
+	// 	h = i
+	// }
+	// if i, _ := strconv.Atoi(os.Getenv("COLUMNS")); i != 0 {
+	// 	w = i
+	// }
+	// if e := t.termioInit(); e != nil {
+	// 	return e
+	// }
 
 	if t.ti.SetFgBgRGB != "" || t.ti.SetFgRGB != "" || t.ti.SetBgRGB != "" {
 		t.truecolor = true
 	}
 	// A user who wants to have his themes honored can
 	// set this environment variable.
-	if os.Getenv("TCELL_TRUECOLOR") == "disable" {
-		t.truecolor = false
-	}
+	// if os.Getenv("TCELL_TRUECOLOR") == "disable" {
+	// 	t.truecolor = false
+	// }
 	if !t.truecolor {
 		t.colors = make(map[Color]Color)
 		t.palette = make([]Color, t.Colors())
@@ -161,10 +187,12 @@ func (t *tScreen) Init() error {
 	t.cells.Resize(w, h)
 	t.cursorx = -1
 	t.cursory = -1
-	t.resize()
+	// t.resize()
 	t.Unlock()
 
-	go t.inputLoop()
+	// go t.inputLoop()
+	t.inbuf = &bytes.Buffer{}
+	t.inchunk = make([]byte, 128)
 
 	return nil
 }
@@ -391,7 +419,7 @@ func (t *tScreen) Fini() {
 	if t.quit != nil {
 		close(t.quit)
 	}
-	t.termioFini()
+	// t.termioFini()
 }
 
 func (t *tScreen) SetStyle(style Style) {
@@ -688,6 +716,8 @@ func (t *tScreen) draw() {
 					// actually will *draw* it.
 					t.cells.SetDirty(x+1, y, true)
 				}
+			} else if width == 0 {
+				width = 1
 			}
 			x += width - 1
 		}
@@ -717,17 +747,20 @@ func (t *tScreen) Size() (int, int) {
 }
 
 func (t *tScreen) resize() {
+	log.Println("t.getWinSize()")
 	if w, h, e := t.getWinSize(); e == nil {
 		if w != t.w || h != t.h {
 			t.cx = -1
 			t.cy = -1
 
+			log.Println("t.cells.Resize(w, h)")
 			t.cells.Resize(w, h)
+			log.Println("t.cells.Invalidate()")
 			t.cells.Invalidate()
 			t.h = h
 			t.w = w
-			ev := NewEventResize(w, h)
-			t.PostEvent(ev)
+			// ev := NewEventResize(w, h)
+			// t.PostEvent(ev)
 		}
 	}
 }
@@ -818,6 +851,7 @@ func (t *tScreen) PostEventWait(ev Event) {
 }
 
 func (t *tScreen) PostEvent(ev Event) error {
+	log.Println("Post event", ev)
 	select {
 	case t.evch <- ev:
 		return nil
@@ -1076,7 +1110,9 @@ func (t *tScreen) parseXtermMouse(buf *bytes.Buffer) (bool, bool) {
 	return true, false
 }
 
-func (t *tScreen) parseFunctionKey(buf *bytes.Buffer) (bool, bool) {
+func (t *tScreen) parseFunctionKey(buf *bytes.Buffer) ([]Event, bool, bool) {
+	var events []Event
+
 	b := buf.Bytes()
 	partial := false
 	for e, k := range t.keycodes {
@@ -1096,20 +1132,23 @@ func (t *tScreen) parseFunctionKey(buf *bytes.Buffer) (bool, bool) {
 				t.escaped = false
 			}
 			ev := NewEventKey(k.key, r, mod)
-			t.PostEvent(ev)
+			// t.PostEvent(ev)
+			events = append(events, ev)
 			for i := 0; i < len(esc); i++ {
 				buf.ReadByte()
 			}
-			return true, true
+			return events, true, true
 		}
 		if bytes.HasPrefix(esc, b) {
 			partial = true
 		}
 	}
-	return partial, false
+	return events, partial, false
 }
 
-func (t *tScreen) parseRune(buf *bytes.Buffer) (bool, bool) {
+func (t *tScreen) parseRune(buf *bytes.Buffer) ([]Event, bool, bool) {
+	var events []Event
+
 	b := buf.Bytes()
 	if b[0] >= ' ' && b[0] <= 0x7F {
 		// printable ASCII easy to deal with -- no encodings
@@ -1119,14 +1158,15 @@ func (t *tScreen) parseRune(buf *bytes.Buffer) (bool, bool) {
 			t.escaped = false
 		}
 		ev := NewEventKey(KeyRune, rune(b[0]), mod)
-		t.PostEvent(ev)
+		// t.PostEvent(ev)
+		events = append(events, ev)
 		buf.ReadByte()
-		return true, true
+		return events, true, true
 	}
 
 	if b[0] < 0x80 {
 		// Low numbered values are control keys, not runes.
-		return false, false
+		return events, false, false
 	}
 
 	utfb := make([]byte, 12)
@@ -1145,20 +1185,21 @@ func (t *tScreen) parseRune(buf *bytes.Buffer) (bool, bool) {
 					t.escaped = false
 				}
 				ev := NewEventKey(KeyRune, r, mod)
-				t.PostEvent(ev)
+				// t.PostEvent(ev)
+				events = append(events, ev)
 			}
 			for nin > 0 {
 				buf.ReadByte()
 				nin--
 			}
-			return true, true
+			return events, true, true
 		}
 	}
 	// Looks like potential escape
-	return true, false
+	return events, true, false
 }
 
-func (t *tScreen) scanInput(buf *bytes.Buffer, expire bool) {
+func (t *tScreen) scanInput(buf *bytes.Buffer, expire bool) (events []Event, err error) {
 
 	t.Lock()
 	defer t.Unlock()
@@ -1172,15 +1213,19 @@ func (t *tScreen) scanInput(buf *bytes.Buffer, expire bool) {
 
 		partials := 0
 
-		if part, comp := t.parseRune(buf); comp {
+		if evs, part, comp := t.parseRune(buf); comp {
+			events = append(events, evs...)
 			continue
 		} else if part {
+			events = append(events, evs...)
 			partials++
 		}
 
-		if part, comp := t.parseFunctionKey(buf); comp {
+		if evs, part, comp := t.parseFunctionKey(buf); comp {
+			events = append(events, evs...)
 			continue
 		} else if part {
+			events = append(events, evs...)
 			partials++
 		}
 
@@ -1205,7 +1250,8 @@ func (t *tScreen) scanInput(buf *bytes.Buffer, expire bool) {
 			if b[0] == '\x1b' {
 				if len(b) == 1 {
 					ev := NewEventKey(KeyEsc, 0, ModNone)
-					t.PostEvent(ev)
+					// t.PostEvent(ev)
+					events = append(events, ev)
 					t.escaped = false
 				} else {
 					t.escaped = true
@@ -1224,7 +1270,8 @@ func (t *tScreen) scanInput(buf *bytes.Buffer, expire bool) {
 				mod = ModAlt
 			}
 			ev := NewEventKey(KeyRune, rune(by), mod)
-			t.PostEvent(ev)
+			// t.PostEvent(ev)
+			events = append(events, ev)
 			continue
 		}
 
@@ -1232,47 +1279,47 @@ func (t *tScreen) scanInput(buf *bytes.Buffer, expire bool) {
 		// some more
 		break
 	}
+	return
 }
 
-func (t *tScreen) inputLoop() {
-	buf := &bytes.Buffer{}
+func (t *tScreen) WaitForInput() ([]Event, error) {
+	// buf := &bytes.Buffer{}
 
-	chunk := make([]byte, 128)
-	for {
-		select {
-		case <-t.quit:
-			close(t.indoneq)
-			return
-		case <-t.sigwinch:
-			t.Lock()
-			t.cx = -1
-			t.cy = -1
-			t.resize()
-			t.cells.Invalidate()
-			t.draw()
-			t.Unlock()
-			continue
-		default:
+	// chunk := make([]byte, 128)
+	// for {
+	// select {
+	// case <-t.quit:
+	// 	close(t.indoneq)
+	// 	return
+	// case <-t.sigwinch:
+	// 	t.Lock()
+	// 	t.cx = -1
+	// 	t.cy = -1
+	// 	t.resize()
+	// 	t.cells.Invalidate()
+	// 	t.draw()
+	// 	t.Unlock()
+	// 	continue
+	// default:
+	// }
+	n, e := t.in.Read(t.inchunk)
+	switch e {
+	case io.EOF:
+		// If we timeout waiting for more bytes, then it's
+		// time to give up on it.  Even at 300 baud it takes
+		// less than 0.5 ms to transmit a whole byte.
+		if t.inbuf.Len() > 0 {
+			return t.scanInput(t.inbuf, true)
 		}
-		n, e := t.in.Read(chunk)
-		switch e {
-		case io.EOF:
-			// If we timeout waiting for more bytes, then it's
-			// time to give up on it.  Even at 300 baud it takes
-			// less than 0.5 ms to transmit a whole byte.
-			if buf.Len() > 0 {
-				t.scanInput(buf, true)
-			}
-			continue
-		case nil:
-		default:
-			close(t.indoneq)
-			return
-		}
-		buf.Write(chunk[:n])
-		// Now we need to parse the input buffer for events
-		t.scanInput(buf, false)
+	case nil:
+	default:
+		// close(t.indoneq)
+		return nil, e
 	}
+	t.inbuf.Write(t.inchunk[:n])
+	// Now we need to parse the input buffer for events
+	return t.scanInput(t.inbuf, true)
+	// }
 }
 
 func (t *tScreen) Sync() {
@@ -1342,4 +1389,18 @@ func (t *tScreen) HasKey(k Key) bool {
 	return t.keyexist[k]
 }
 
-func (t *tScreen) Resize(int, int, int, int) {}
+func (t *tScreen) Resize(w, h, x, y int) {
+	if w != t.w || h != t.h {
+		t.cx = -1
+		t.cy = -1
+
+		log.Println("t.cells.Resize(w, h)")
+		t.cells.Resize(w, h)
+		log.Println("t.cells.Invalidate()")
+		t.cells.Invalidate()
+		t.h = h
+		t.w = w
+		// ev := NewEventResize(w, h)
+		// t.PostEvent(ev)
+	}
+}
